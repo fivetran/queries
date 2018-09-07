@@ -1,18 +1,18 @@
 with ticket_schedule as (
   select ticket_id,
          schedule_id,
-         created_at,
-         coalesce(lead(created_at, 1) over ticket_schedule_timeline, timestamp("9999-12-31 01:01:01")) as invalidated_at
+         created_at as schedule_created_at,
+         coalesce(lead(created_at, 1) over ticket_schedule_timeline, timestamp("9999-12-31 01:01:01")) as schedule_invalidated_at
   from zendesk.ticket_schedule
   window ticket_schedule_timeline as (partition by ticket_id order by created_at)
 ),
 ticket_full_solved_time as (
   select ticket.id as ticket_id,
-         ticket_schedule.created_at as created_at,
-         ticket_schedule.invalidated_at,
+         ticket_schedule.schedule_created_at,
+         ticket_schedule.schedule_invalidated_at,
          ticket_schedule.schedule_id,
-         round(timestamp_diff(ticket_schedule.created_at, timestamp_trunc(ticket_schedule.created_at, week), second)/60, 0) as start_time_in_minutes_from_week,
-         greatest(0, round(timestamp_diff(least(ticket_schedule.invalidated_at, max(ticket_field_history.updated)), ticket_schedule.created_at, second)/60, 0)) as raw_delta_in_minutes
+         round(timestamp_diff(ticket_schedule.schedule_created_at, timestamp_trunc(ticket_schedule.schedule_created_at, week), second)/60, 0) as start_time_in_minutes_from_week,
+         greatest(0, round(timestamp_diff(least(ticket_schedule.schedule_invalidated_at, max(ticket_field_history.updated)), ticket_schedule.schedule_created_at, second)/60, 0)) as raw_delta_in_minutes
   from zendesk.ticket
   left join ticket_schedule on ticket.id = ticket_schedule.ticket_id
   join zendesk.ticket_field_history on ticket.id = ticket_field_history.ticket_id
