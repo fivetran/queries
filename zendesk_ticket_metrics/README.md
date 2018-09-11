@@ -1,9 +1,9 @@
-using the provided SQL queries, create the following views
+using the provided SQL queries, create the following 4 views
 
-   first_response_time
-   first_resolution_time
-   full_resolution_time
-   wait_times
+   (1) first_response_time, 
+   (2) first_resolution_time, 
+   (3) full_resolution_time, 
+   (4) wait_times
 
 once these views have been created use the view_join_pseudocode.sql to combine them
 
