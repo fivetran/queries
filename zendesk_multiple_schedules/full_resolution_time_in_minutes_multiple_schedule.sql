@@ -15,7 +15,7 @@ ticket_full_solved_time as (
          greatest(0, round(timestamp_diff(least(ticket_schedule.schedule_invalidated_at, max(ticket_field_history.updated)), ticket_schedule.schedule_created_at, second)/60, 0)) as raw_delta_in_minutes
   from zendesk.ticket
   left join ticket_schedule on ticket.id = ticket_schedule.ticket_id
-  join zendesk.ticket_field_history on ticket.id = ticket_field_history.ticket_id
+  left join zendesk.ticket_field_history on ticket.id = ticket_field_history.ticket_id
   where ticket_field_history.value = 'solved'
   group by 1, 2, 3, 4
 ),
@@ -48,11 +48,16 @@ business_minutes as (
   from intercepted_periods
   group by 1
   order by 1
+),
+calendar_minutes as (
+  select ticket_id,
+         sum(raw_delta_in_minutes) as full_resolution_time_in_calendar_minutes
+  from ticket_full_solved_time
+  group by 1
 )
-select business_minutes.ticket_id,
-       business_minutes.full_resolution_time_in_business_minutes,
-       sum(calendar_minutes.raw_delta_in_minutes) as full_resolution_time_in_calendar_minutes
-from business_minutes
-join ticket_full_solved_time as calendar_minutes
+select calendar_minutes.ticket_id,
+       calendar_minutes.full_resolution_time_in_calendar_minutes,
+       business_minutes.full_resolution_time_in_business_minutes
+from calendar_minutes
+left join business_minutes
   on business_minutes.ticket_id = calendar_minutes.ticket_id
-group by 1, 2
