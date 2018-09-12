@@ -1,3 +1,4 @@
+CREATE OR REPLACE VIEW zendesk.first_response_time AS (
 with ticket_schedule as (
   select ticket_id,
          schedule_id,
@@ -69,3 +70,4 @@ select calendar_minutes.ticket_id,
 from calendar_minutes
 left join business_minutes
   on business_minutes.ticket_id = calendar_minutes.ticket_id
+);
