@@ -1,10 +1,20 @@
-using the provided SQL queries, create the following 4 views
+# Zendesk Ticket Metrics
+
+These queries will re-create the Zendesk ticket metrics using the Fivetran data schema. There are two options:
+
+For Zendesk Enterprise clients, it is recommended to use the `multiple_schedules` VIEWs.  Zendesk's own ticket metric calculations only use the business hours schedule at the time the metric is calculated, which results in incorrect calculations for first response time, first resolution time, full resolution time, and wait times.
+
+For non-Enterprise clients, it is recommended to use the `single_schedules` VIEWs.  These are still an improvement over Zendesk's own ticket metric calculations because it predictably uses the schedule in use prior to when an event happens. Zendesk's own ticket metric calculations have a race-condition when an event (such as changing the status of a ticket to "solved") triggers a schedule changed
+
+## Instructions
+
+Using the provided SQL queries, create the following 4 views
 
    (1) first_response_time, 
    (2) first_resolution_time, 
    (3) full_resolution_time, 
    (4) wait_times
 
-once these views have been created use ticket_metrics.sql to combine them
+once these views have been created use ticket_metrics.sql to create the `ticket_metrics` VIEW that combines them into one table.
 
-# note that all queries assume that the schema name is "zendesk", so a rename will be needed if the schema name used is different
+#### Note: that all queries assume that the schema name is "zendesk", so a rename will be needed if the schema name used is different
