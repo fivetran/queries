@@ -1,3 +1,4 @@
+--- Create the 4 dependent views before executing this
 CREATE VIEW zendesk.ticket_metrics AS (
 WITH group_stations AS (
     SELECT
