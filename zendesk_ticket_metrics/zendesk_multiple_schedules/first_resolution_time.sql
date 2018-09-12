@@ -1,4 +1,4 @@
-CREATE OR REPLACE VIEW zendesk.multiple_schedules AS (
+CREATE OR REPLACE VIEW zendesk.first_resolution_time AS (
 with ticket_schedule as (
   select ticket_id,
          schedule_id,
