@@ -1,3 +1,4 @@
+CREATE OR REPLACE VIEW zendesk.wait_times AS (
 with ticket_status_timeline as (
   select ticket_id,
          value,
@@ -106,3 +107,4 @@ select calendar_minutes_aggregated.ticket_id,
 from calendar_minutes_aggregated
 left join business_minutes_aggregated
   on business_minutes_aggregated.ticket_id = calendar_minutes_aggregated.ticket_id
+);
