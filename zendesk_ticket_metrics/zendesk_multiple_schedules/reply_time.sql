@@ -1,4 +1,4 @@
-CREATE OR REPLACE VIEW zendesk.first_response_time AS (
+CREATE OR REPLACE VIEW zendesk.reply_time AS (
 with ticket_schedule as (
   select ticket_id,
          schedule_id,
@@ -53,20 +53,20 @@ intercepted_periods as (
 ),
 business_minutes as (
   select ticket_id,
-         sum(scheduled_minutes) as first_resoponse_time_in_business_minutes
+         sum(scheduled_minutes) as reply_time_time_in_business_minutes
   from intercepted_periods
   group by 1
   order by 1
 ),
 calendar_minutes as (
   select ticket_id,
-         sum(raw_delta_in_minutes) as first_resoponse_time_in_calendar_minutes
+         sum(raw_delta_in_minutes) as reply_time_time_in_calendar_minutes
   from ticket_first_responded_time
   group by 1
 )
 select calendar_minutes.ticket_id,
-       calendar_minutes.first_resoponse_time_in_calendar_minutes,
-       business_minutes.first_resoponse_time_in_business_minutes
+       calendar_minutes.reply_time_time_in_calendar_minutes,
+       business_minutes.reply_time_time_in_business_minutes
 from calendar_minutes
 left join business_minutes
   on business_minutes.ticket_id = calendar_minutes.ticket_id
