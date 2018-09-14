@@ -16,19 +16,18 @@ assignee_stations AS (
     WHERE field_name = 'assignee_id' 
     GROUP BY ticket_id
 ),
-ticket_status_changes AS ( 
-    SELECT 
-        ticket_id,
-        value AS status, 
-        LAG(value, 1) OVER (PARTITION BY ticket_id ORDER BY updated) AS prev_status
-    FROM zendesk.ticket_field_history
-    WHERE field_name = 'status' 
-),
 reopens AS (
     SELECT 
         ticket_id, 
         COUNT(ticket_id) AS reopens
-    FROM ticket_status_changes 
+    FROM ( 
+        SELECT 
+            ticket_id,
+            value AS status, 
+            LAG(value, 1) OVER (PARTITION BY ticket_id ORDER BY updated) AS prev_status
+        FROM zendesk.ticket_field_history
+        WHERE field_name = 'status' 
+    ) 
     WHERE prev_status = 'solved' AND status = 'open' 
     GROUP BY ticket_id
 ),
@@ -111,8 +110,8 @@ SELECT ticket.id AS ticket_id,
     assigned_at.assigned_at,
     solved_at.solved_at,
     latest_comment_added_at.latest_comment_added_at,
-    first_response_time.first_resoponse_time_in_calendar_minutes as reply_time_in_calendar_minutes,
-    first_response_time.first_resoponse_time_in_business_minutes as reply_time_in_business_minutes,
+    reply_time.reply_time_in_calendar_minutes,
+    reply_time.first_resoponse_time_in_business_minutes,
     first_resolution_time.first_resolution_time_in_calendar_minutes,
     first_resolution_time.first_resolution_time_in_business_minutes,
     full_resolution_time.full_resolution_time_in_calendar_minutes,
@@ -135,7 +134,7 @@ LEFT JOIN initially_assigned_at ON ticket.id = initially_assigned_at.ticket_id
 LEFT JOIN assigned_at ON ticket.id = assigned_at.ticket_id
 LEFT JOIN solved_at ON ticket.id = solved_at.ticket_id
 LEFT JOIN latest_comment_added_at ON ticket.id = latest_comment_added_at.ticket_id
-LEFT JOIN zendesk.first_response_time ON ticket.id = first_response_time.ticket_id
+LEFT JOIN zendesk.reply_time ON ticket.id = reply_time.ticket_id
 LEFT JOIN zendesk.first_resolution_time ON ticket.id = first_resolution_time.ticket_id
 LEFT JOIN zendesk.full_resolution_time ON ticket.id = full_resolution_time.ticket_id
 LEFT JOIN zendesk.wait_times ON ticket.id = wait_times.ticket_id
