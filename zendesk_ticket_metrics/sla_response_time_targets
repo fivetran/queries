@@ -1,0 +1,85 @@
+CREATE VIEW zendesk.sla_response_time_targets as (
+with business_minutes_in_week as (
+  select
+   ticket_schedule.ticket_id,
+   ticket_schedule.created_at,
+   schedule.id as schedule_id, 
+   sum(end_time_utc - start_time_utc) as business_minutes_in_week
+  from zendesk.ticket_schedule
+  join zendesk.schedule on ticket_schedule.schedule_id = schedule.id
+  group by 1,2,3
+), bussiness_weeks_to_target as (
+  select 
+   metric_by_ticket.ticket_id,
+   metric_by_ticket.metric,
+   metric_by_ticket.instance_id,
+   metric_by_ticket.sla_policy_id,
+   metric_by_ticket.time,
+   business_minutes_in_week.schedule_id,
+   target,
+   cast(ceiling(metric_by_ticket.target / business_minutes_in_week.business_minutes_in_week) as int64) as bussiness_weeks_to_target
+  from zendesk.sla_metric_by_ticket
+  join business_minutes_in_week on metric_by_ticket.ticket_id = business_minutes_in_week.ticket_id
+   and metric_by_ticket.time = business_minutes_in_week.created_at
+), adding_start_end_times as (
+  select
+   ticket_id,
+   metric,
+   instance_id,
+   sla_policy_id,
+   time,
+   schedule_id,
+   target,
+   bussiness_weeks_to_target.bussiness_weeks_to_target,
+   start_time_utc,
+   end_time_utc
+  from bussiness_weeks_to_target 
+  join zendesk.schedule on bussiness_weeks_to_target.schedule_id = schedule.id
+), adding_week_number as (
+  select
+   *
+  from adding_start_end_times, unnest(generate_array(0, bussiness_weeks_to_target)) as week_number
+), adding_start_of_week as ( 
+  select 
+   *,
+   timestamp_add(timestamp_trunc(time,week), interval week_number*(7*24*60) minute) as start_of_week
+  from adding_week_number
+), start_time_in_minutes as (
+  select 
+   *,
+   greatest(timestamp_diff(time,start_of_week,minute),start_time_utc) as start_time
+  from adding_start_of_week
+  where metric in ('first_reply_time','next_reply_time')
+), running_time as (
+  select 
+   *,
+   target - sum(end_time_utc-if(end_time_utc +(week_number*(7*24*60)) > start_time, greatest(start_time_utc,start_time),end_time_utc)) over running_total as running_minutes
+  from start_time_in_minutes
+  window running_total as (partition by ticket_id, metric, instance_id order by week_number,start_Time_utc rows between unbounded preceding and current row)
+), breach_time as (
+  select
+   ticket_id,
+   metric,
+   instance_id,
+   sla_policy_Id,
+   schedule_id,
+   min(timestamp_add(start_of_week,interval end_time_utc+running_minutes minute)) as breach_time
+  from running_time
+  where running_minutes<0
+  group by 1,2,3,4,5
+)
+
+select 
+ breach_time.ticket_id,
+ breach_time.metric,
+ breach_time.instance_id,
+ breach_time.sla_policy_id,
+ breach_time.schedule_id,
+ sla_metric_by_ticket.time sla_start_time,
+ if(business_hours,breach_time.breach_time,timestamp_add(time, interval target minute)) as breach_time,
+ sla_metric_by_ticket.target
+from breach_time 
+join zendesk.sla_metric_by_ticket on breach_time.ticket_id = sla_metric_by_ticket.ticket_id 
+ and breach_time.metric = sla_metric_by_ticket.metric
+ and breach_time.instance_id = sla_metric_by_ticket.instance_id
+)
