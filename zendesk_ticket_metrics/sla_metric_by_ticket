@@ -1,75 +1,75 @@
 CREATE VIEW zendesk.sla_metric_by_ticket AS (
-with ticket_metric_ranked as (
- select 
-  instance_id,
-  metric,
-  time,
-  sla_policy_id,
-  ticket_id
- from (
+  with ticket_metric_ranked as (
    select 
     instance_id,
     metric,
     time,
     sla_policy_id,
+    ticket_id
+   from (
+     select 
+      instance_id,
+      metric,
+      time,
+      sla_policy_id,
+      ticket_id,
+      row_number() over (partition by instance_id,metric,ticket_id order by time asc) rank
+     from zendesk.ticket_metric_event
+     where type='apply_sla'
+   ) as ticket_metric_event
+   where rank=1
+  ), ticket_metric as (
+   select distinct
     ticket_id,
-    row_number() over (partition by instance_id,metric,ticket_id order by time asc) rank
-   from zendesk.ticket_metric_event
-   where type='apply_sla'
- ) as ticket_metric_event
- where rank=1
-), ticket_metric as (
- select distinct
-  ticket_id,
-  instance_id,
-  time,
-  case 
-   when metric = "reply_time" and instance_id =1 then "first_reply_time"
-   when metric = "reply_time" and instance_id <>1 then "next_reply_time"
-   else metric 
-  end as metric,
-  sla_policy_id
-  from ticket_metric_ranked
-), ticket_priority as (
- select 
-  ticket_id,
-  value as priority,
-  updated,
-  coalesce(lead(updated) over (partition by field_name,ticket_id order by updated),'2999-12-31 23:59:59 UTC') as changed_at
-from zendesk.ticket_field_history
-where field_name ='priority'
-), sla_policy_metric_history_ranked as (
- select 
-  sla_policy_id,
-  metric,
-  priority,
-  business_hours,
-  target
- from (
-  select 
-   sla_policy_id,
-   metric,
-   priority,
-   target,
-   business_hours,
-   row_number() over (partition by sla_policy_id, metric, priority order by _fivetran_synced desc) as rank 
-  from zendesk.sla_policy_metric_history
- ) as ranks
- where rank =1
-)
-  select 
-   ticket_metric.ticket_id,
-   sla_policy_metric_history_ranked.metric,
-   business_hours,
-   instance_id,
-   time,
-   sla_policy_metric_history_ranked.target,
-   ticket_metric.sla_policy_id
-  from ticket_metric
-  join ticket_priority  on ticket_metric.ticket_id = ticket_priority.ticket_id
-   and ticket_metric.time >= ticket_priority.updated
-   and ticket_metric.time < ticket_priority.changed_at
-  join sla_policy_metric_history_ranked on ticket_metric.sla_policy_id = sla_policy_metric_history_ranked.sla_policy_id 
-   and ticket_metric.metric=sla_policy_metric_history_ranked.metric 
-   and ticket_priority.priority = sla_policy_metric_history_ranked.priority
-)
+    instance_id,
+    time,
+    case 
+     when metric = "reply_time" and instance_id =1 then "first_reply_time"
+     when metric = "reply_time" and instance_id >1 then "next_reply_time"
+     else metric 
+    end as metric,
+    sla_policy_id
+    from ticket_metric_ranked
+  ), ticket_priority as (
+   select 
+    ticket_id,
+    value as priority,
+    updated,
+    coalesce(lead(updated) over (partition by ticket_id order by updated),'2999-12-31 23:59:59 UTC') as valid_until
+  from zendesk.ticket_field_history
+  where field_name ='priority'
+  ), sla_policy_metric_history_ranked as (
+   select 
+    sla_policy_id,
+    metric,
+    priority,
+    business_hours,
+    target
+   from (
+    select 
+     sla_policy_id,
+     metric,
+     priority,
+     target,
+     business_hours,
+     row_number() over (partition by sla_policy_id, metric, priority order by sla_policy_updated_at desc) as rank 
+    from zendesk.sla_policy_metric_history
+   ) as ranks
+   where rank =1
+  )
+    select 
+     ticket_metric.ticket_id,
+     sla_policy_metric_history_ranked.metric,
+     sla_policy_metric_history_ranked.business_hours,
+     ticket_metric.instance_id,
+     ticket_metric.time sla_applied_at,
+     sla_policy_metric_history_ranked.target,
+     ticket_metric.sla_policy_id
+    from ticket_metric
+    join ticket_priority  on ticket_metric.ticket_id = ticket_priority.ticket_id
+     and ticket_metric.time >= ticket_priority.updated
+     and ticket_metric.time < ticket_priority.valid_until
+    join sla_policy_metric_history_ranked on ticket_metric.sla_policy_id = sla_policy_metric_history_ranked.sla_policy_id 
+     and ticket_metric.metric=sla_policy_metric_history_ranked.metric 
+     and ticket_priority.priority = sla_policy_metric_history_ranked.priority
+  )
