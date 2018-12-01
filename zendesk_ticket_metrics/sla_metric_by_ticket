@@ -1,5 +1,5 @@
 CREATE VIEW zendesk.sla_metric_by_ticket AS (
-  with ticket_metric_ranked as (
+  with sla_metric_ranked as (
    select 
     instance_id,
     metric,
@@ -14,9 +14,8 @@ CREATE VIEW zendesk.sla_metric_by_ticket AS (
       sla_policy_id,
       ticket_id,
       row_number() over (partition by instance_id,metric,ticket_id order by time asc) rank
-     from zendesk.ticket_metric_event
-     where type='apply_sla'
-   ) as ticket_metric_event
+     from sla_polciy_event
+   ) as sla_metric_event
    where rank=1
   ), ticket_metric as (
    select distinct
@@ -29,7 +28,7 @@ CREATE VIEW zendesk.sla_metric_by_ticket AS (
      else metric 
     end as metric,
     sla_policy_id
-    from ticket_metric_ranked
+    from sla_metric_ranked
   ), ticket_priority as (
    select 
     ticket_id,
