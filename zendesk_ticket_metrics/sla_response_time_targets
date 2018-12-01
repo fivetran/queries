@@ -1,5 +1,13 @@
 CREATE VIEW zendesk.sla_response_time_targets as (
-with ticket_schedule_picked as (
+with ticket_first_responded_at as (
+  select ticket_comment.ticket_id,
+         min(created) as responded_at
+  from zendesk.ticket_comment
+  join zendesk.user
+    on ticket_comment.user_id = user.id
+  where user.role in ('admin', 'agent') and public
+  group by ticket_id
+), ticket_schedule_picked as (
   select
    distinct 
    ticket_id,
@@ -52,7 +60,7 @@ with ticket_schedule_picked as (
    *,
    greatest(timestamp_diff(sla_applied_at,start_of_week,minute),start_time_utc) as start_time
   from adding_start_of_week
-  where metric in ('first_reply_time','next_reply_time')
+  where metric in ('first_reply_time')
 ), time_left as (
   select 
    *,
@@ -80,9 +88,11 @@ select
  breach_time.schedule_id,
  sla_metric_by_ticket.sla_applied_at sla_start_time,
  if(business_hours,breach_time.breach_time,timestamp_add(sla_applied_at, interval target minute)) as breach_time,
- sla_metric_by_ticket.target
+ sla_metric_by_ticket.target,
+ if(ticket_first_responded_at.responded_at is null, true, false) as is_active
 from breach_time 
 join sla_metric_by_ticket on breach_time.ticket_id = sla_metric_by_ticket.ticket_id 
  and breach_time.metric = sla_metric_by_ticket.metric
  and breach_time.instance_id = sla_metric_by_ticket.instance_id
+left join ticket_first_responded_at on breach_time.ticket_id = ticket_first_responded_at.ticket_id
 )
