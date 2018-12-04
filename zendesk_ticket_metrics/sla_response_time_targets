@@ -1,5 +1,6 @@
 CREATE VIEW zendesk.sla_response_time_targets as (
 with ticket_first_responded_at as (
+ -- First reponse time per ticket. Used for is_active 
   select ticket_comment.ticket_id,
          min(created) as responded_at
   from zendesk.ticket_comment
@@ -8,12 +9,14 @@ with ticket_first_responded_at as (
   where user.role in ('admin', 'agent') and public
   group by ticket_id
 ), ticket_schedule_picked as (
+-- use first schedule picked per ticket
   select
    distinct 
    ticket_id,
    first_value(schedule_id) over (partition by ticket_id order by created_at) schedule_id
   from zendesk.ticket_schedule
 ), schedule_business_minutes_in_week as (
+-- Total minutes in week, used for weeks array
   select 
    id as schedule_id,
    sum(end_time_utc - start_time_utc) as business_minutes_in_week
@@ -50,7 +53,7 @@ with ticket_first_responded_at as (
   select
    *
   from adding_start_end_times, unnest(generate_array(0, bussiness_weeks_to_target)) as week_number
-), adding_start_of_week as ( 
+), adding_start_of_week as (
   select 
    *,
    timestamp_add(timestamp_trunc(sla_applied_at,week), interval week_number*(7*24*60) minute) as start_of_week
@@ -62,12 +65,14 @@ with ticket_first_responded_at as (
   from adding_start_of_week
   where metric in ('first_reply_time')
 ), time_left as (
+-- track time worked against the target to calculate breach time
   select 
    *,
    target - sum(end_time_utc-if(end_time_utc +(week_number*(7*24*60)) > start_time, greatest(start_time_utc,start_time),end_time_utc)) over running_total as time_left
   from start_time_in_minutes
   window running_total as (partition by ticket_id, metric, instance_id order by week_number,start_Time_utc rows between unbounded preceding and current row)
 ), breach_time as (
+-- find breach by looking at min negative time_left value, and adding the time back to the schedule end time
   select
    ticket_id,
    metric,
