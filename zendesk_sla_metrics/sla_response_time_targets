@@ -1,0 +1,103 @@
+CREATE VIEW zendesk.sla_response_time_targets as (
+with ticket_first_responded_at as (
+ -- First reponse time per ticket. Used for is_active 
+  select ticket_comment.ticket_id,
+         min(created) as responded_at
+  from zendesk.ticket_comment
+  join zendesk.user
+    on ticket_comment.user_id = user.id
+  where user.role in ('admin', 'agent') and public
+  group by ticket_id
+), ticket_schedule_picked as (
+-- use first schedule picked per ticket
+  select
+   distinct 
+   ticket_id,
+   first_value(schedule_id) over (partition by ticket_id order by created_at) schedule_id
+  from zendesk.ticket_schedule
+), schedule_business_minutes_in_week as (
+-- Total minutes in week, used for weeks array
+  select 
+   id as schedule_id,
+   sum(end_time_utc - start_time_utc) as business_minutes_in_week
+  from zendesk.schedule
+  group by 1
+), bussiness_weeks_to_target as (
+  select 
+   sla_metric_by_ticket.ticket_id,
+   sla_metric_by_ticket.metric,
+   sla_metric_by_ticket.instance_id,
+   sla_metric_by_ticket.sla_policy_id,
+   sla_metric_by_ticket.sla_applied_at,
+   ticket_schedule_picked.schedule_id,
+   sla_metric_by_ticket.target,
+   cast(ceiling(sla_metric_by_ticket.target / schedule_business_minutes_in_week.business_minutes_in_week) as int64) as bussiness_weeks_to_target
+  from sla_metric_by_ticket
+  join ticket_schedule_picked on sla_metric_by_ticket.ticket_id = ticket_schedule_picked.ticket_id 
+  join schedule_business_minutes_in_week on ticket_schedule_picked.schedule_id = schedule_business_minutes_in_week.schedule_id
+), adding_start_end_times as (
+  select
+   bussiness_weeks_to_target.ticket_id,
+   bussiness_weeks_to_target.metric,
+   bussiness_weeks_to_target.instance_id,
+   bussiness_weeks_to_target.sla_policy_id,
+   bussiness_weeks_to_target.sla_applied_at,
+   bussiness_weeks_to_target.schedule_id,
+   bussiness_weeks_to_target.target,
+   bussiness_weeks_to_target.bussiness_weeks_to_target,
+   schedule.start_time_utc,
+   schedule.end_time_utc
+  from bussiness_weeks_to_target 
+  join zendesk.schedule on bussiness_weeks_to_target.schedule_id = schedule.id
+), adding_week_number as (
+  select
+   *
+  from adding_start_end_times, unnest(generate_array(0, bussiness_weeks_to_target)) as week_number
+), adding_start_of_week as (
+  select 
+   *,
+   timestamp_add(timestamp_trunc(sla_applied_at,week), interval week_number*(7*24*60) minute) as start_of_week
+  from adding_week_number
+), start_time_in_minutes as (
+  select 
+   *,
+   greatest(timestamp_diff(sla_applied_at,start_of_week,minute),start_time_utc) as start_time
+  from adding_start_of_week
+  where metric in ('first_reply_time')
+), time_left as (
+-- track time worked against the target to calculate breach time
+  select 
+   *,
+   target - sum(end_time_utc-if(end_time_utc +(week_number*(7*24*60)) > start_time, greatest(start_time_utc,start_time),end_time_utc)) over running_total as time_left
+  from start_time_in_minutes
+  window running_total as (partition by ticket_id, metric, instance_id order by week_number,start_Time_utc rows between unbounded preceding and current row)
+), breach_time as (
+-- find breach by looking at min negative time_left value, and adding the time back to the schedule end time
+  select
+   ticket_id,
+   metric,
+   instance_id,
+   sla_policy_Id,
+   schedule_id,
+   min(timestamp_add(start_of_week,interval end_time_utc+time_left.time_left minute)) as breach_time
+  from time_left
+  where time_left.time_left<0
+  group by 1,2,3,4,5
+)
+
+select 
+ breach_time.ticket_id,
+ breach_time.metric,
+ breach_time.instance_id,
+ breach_time.sla_policy_id,
+ breach_time.schedule_id,
+ sla_metric_by_ticket.sla_applied_at sla_start_time,
+ if(business_hours,breach_time.breach_time,timestamp_add(sla_applied_at, interval target minute)) as breach_time,
+ sla_metric_by_ticket.target,
+ if(ticket_first_responded_at.responded_at is null, true, false) as is_active
+from breach_time 
+join sla_metric_by_ticket on breach_time.ticket_id = sla_metric_by_ticket.ticket_id 
+ and breach_time.metric = sla_metric_by_ticket.metric
+ and breach_time.instance_id = sla_metric_by_ticket.instance_id
+left join ticket_first_responded_at on breach_time.ticket_id = ticket_first_responded_at.ticket_id
+)
