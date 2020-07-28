@@ -3,7 +3,8 @@ with sla_policy_applied as (
   
   select
     ticket_field_history.ticket_id,
-    ticket.created_at as created_at,
+    ticket.created_at as ticket_created_at,
+    ticket.status as ticket_current_status,
     ticket_field_history.field_name as metric,
     ticket_field_history.updated as sla_applied_at,
     cast(json_extract(ticket_field_history.value, '$.minutes') as int64) as target,
@@ -180,17 +181,19 @@ with sla_policy_applied as (
     updated as solved_at
   from zendesk.ticket_field_history
   where field_name = 'status'
-  and value = 'solved'
+  and value in ('solved','closed')
 
 ), reply_time as (
     select 
       ticket_comment.ticket_id,
-      ticket_comment.created as reply_at
+      ticket_comment.created as reply_at,
+      commenter.role
     from zendesk.ticket_comment
     join zendesk.user as commenter
       on commenter.id = ticket_comment.user_id
     where ticket_comment.public
-    and commenter.role in ('agent','admin')
+    and (commenter.role in ('agent','admin')
+    or commenter.email like '%@sisense.com')
 
 ), reply_time_breached_at_with_next_reply_timestamp as (
 
@@ -202,18 +205,28 @@ with sla_policy_applied as (
   left join reply_time
     on reply_time.ticket_id = reply_time_breached_at.ticket_id
     and reply_time.reply_at > reply_time_breached_at.sla_applied_at
-  join ticket_solved_times
+  left join ticket_solved_times
     on reply_time_breached_at.ticket_id = ticket_solved_times.ticket_id
     and ticket_solved_times.solved_at > reply_time_breached_at.sla_applied_at
   group by 1,2,3,4,5,6
-
+), reply_time_breached_at_remove_old_sla as (
+  select 
+    *,
+    lead(sla_applied_at) over (partition by ticket_id, metric, in_business_hours order by sla_applied_at) as updated_sla_policy_starts_at,
+    case when 
+      lead(sla_applied_at) over (partition by ticket_id, metric, in_business_hours order by sla_applied_at) --updated sla policy start at time
+      < breached_at then true else false end as is_stale_sla_policy
+  from reply_time_breached_at_with_next_reply_timestamp
+  
 -- final query that filters out tickets that were solved or replied to before breach time
 ), reply_time_breach as (
   select 
     * 
-  from reply_time_breached_at_with_next_reply_timestamp
-  where breached_at < agent_reply_at
-    and breached_at < next_solved_at
+  from reply_time_breached_at_remove_old_sla
+  where (breached_at < agent_reply_at and breached_at < next_solved_at)
+    or (breached_at < agent_reply_at and next_solved_at is null)
+    or (agent_reply_at is null and breached_at < next_solved_at)
+    or (agent_reply_at is null and next_solved_at is null)    
 
 -- AGENT WORK TIME
 -- This is more complicated, as SLAs minutes are only counted while the ticket is in 'new' or 'open' status.
@@ -221,10 +234,8 @@ with sla_policy_applied as (
 -- For business hours, only 'new' or 'open' status hours are counted if they are also during business hours
 ), agent_work_time_business_sla as (
   select
-    sla_policy_applied.*,
-    ticket.created_at as ticket_created_at
+    sla_policy_applied.*
   from sla_policy_applied 
-  join zendesk.ticket on ticket.id = sla_policy_applied.ticket_id
   where sla_policy_applied.metric = 'agent_work_time'
     and sla_policy_applied.in_business_hours = 'true'
 
@@ -235,7 +246,7 @@ with sla_policy_applied as (
     ticket_id,
     updated as valid_starting_at,
     coalesce(lead(updated) over (partition by ticket_id, field_name order by updated)
-      , current_timestamp) as valid_ending_at,
+      , timestamp_add(current_timestamp, interval 30 day)) as valid_ending_at,
     value as status,
   from zendesk.ticket_field_history
   where field_name = 'status'
@@ -243,9 +254,17 @@ with sla_policy_applied as (
 ), ticket_agent_work_times as (
 
   select  
-    *
+    ticket_historical_status.ticket_id,
+    agent_work_time_business_sla.ticket_created_at,
+    greatest(ticket_historical_status.valid_starting_at, agent_work_time_business_sla.sla_applied_at) as valid_starting_at,
+    ticket_historical_status.valid_ending_at,
+    agent_work_time_business_sla.sla_applied_at,
+    agent_work_time_business_sla.target,    
   from ticket_historical_status
-  where status in ('new', 'open')
+  join agent_work_time_business_sla
+    on ticket_historical_status.ticket_id = agent_work_time_business_sla.ticket_id
+  where status in ('new', 'open') -- these are the only statuses that count as "agent work time"
+  and sla_applied_at < valid_ending_at
 
 ), schedule as (
 
@@ -260,101 +279,108 @@ with sla_policy_applied as (
   
     select
       ticket_agent_work_times.ticket_id,
-      ticket_agent_work_times.status as ticket_status,
+      ticket_agent_work_times.sla_applied_at,
+--       ticket_agent_work_times.ticket_created_at,
+      ticket_agent_work_times.target,      
       ticket_schedule.schedule_id,
-      greatest(valid_starting_at, schedule_created_at) as status_schedule_start,
-      least(valid_ending_at, schedule_invalidated_at) as status_schedule_end
+      greatest(valid_starting_at, schedule_created_at) as valid_starting_at,
+      least(valid_ending_at, schedule_invalidated_at) as valid_ending_at
     from ticket_agent_work_times
     left join ticket_schedule
       on ticket_agent_work_times.ticket_id = ticket_schedule.ticket_id
     where timestamp_diff(least(valid_ending_at, schedule_invalidated_at), greatest(valid_starting_at, schedule_created_at), second) > 0
+
 
 ), ticket_full_solved_time as (
 
     select 
       ticket_status_crossed_with_schedule.*,
       round(timestamp_diff(
-              ticket_status_crossed_with_schedule.status_schedule_start, 
+              ticket_status_crossed_with_schedule.valid_starting_at, 
               timestamp_trunc(
-                  ticket_status_crossed_with_schedule.status_schedule_start, 
+                  ticket_status_crossed_with_schedule.valid_starting_at, 
                   week), 
               second)/60,
-            0) as start_time_in_minutes_from_week,
+            0) as valid_starting_at_in_minutes_from_week,
       round(timestamp_diff(
-              ticket_status_crossed_with_schedule.status_schedule_end, 
-              ticket_status_crossed_with_schedule.status_schedule_start, 
+              ticket_status_crossed_with_schedule.valid_ending_at, 
+              ticket_status_crossed_with_schedule.valid_starting_at, 
               second)/60,
             0) as raw_delta_in_minutes
     from ticket_status_crossed_with_schedule
-    group by 1, 2, 3, 4, 5
+    group by 1, 2, 3, 4, 5, 6, 7
 
 ), weekly_period_agent_work_time as (
 
-    select ticket_id,
-          start_time_in_minutes_from_week,
-          raw_delta_in_minutes,
-          week_number,
-          schedule_id,
-          ticket_status,
-          greatest(0, start_time_in_minutes_from_week - week_number * (7*24*60)) as ticket_week_start_time,
-          least(start_time_in_minutes_from_week + raw_delta_in_minutes - week_number * (7*24*60), (7*24*60)) as ticket_week_end_time
+    select 
+      ticket_id,
+      sla_applied_at,
+      valid_starting_at,
+      valid_ending_at,
+      target,
+      valid_starting_at_in_minutes_from_week,
+      raw_delta_in_minutes,
+      week_number,
+      schedule_id,
+      greatest(0, valid_starting_at_in_minutes_from_week - week_number * (7*24*60)) as ticket_week_start_time_minute,
+      least(valid_starting_at_in_minutes_from_week + raw_delta_in_minutes - week_number * (7*24*60), (7*24*60)) as ticket_week_end_time_minute
     from ticket_full_solved_time,
-        unnest(generate_array(0, floor((start_time_in_minutes_from_week + raw_delta_in_minutes) / (7*24*60)), 1)) as week_number
+        unnest(generate_array(0, floor((valid_starting_at_in_minutes_from_week + raw_delta_in_minutes) / (7*24*60)), 1)) as week_number
 
 ), intercepted_periods_agent as (
   
     select 
       weekly_period_agent_work_time.ticket_id,
+      weekly_period_agent_work_time.sla_applied_at,
+      weekly_period_agent_work_time.target,
+      weekly_period_agent_work_time.valid_starting_at,
+      weekly_period_agent_work_time.valid_ending_at,
       weekly_period_agent_work_time.week_number,
-      weekly_period_agent_work_time.schedule_id,
-      weekly_period_agent_work_time.ticket_status,
-      weekly_period_agent_work_time.ticket_week_start_time,
-      weekly_period_agent_work_time.ticket_week_end_time,
+      weekly_period_agent_work_time.ticket_week_start_time_minute,
+      weekly_period_agent_work_time.ticket_week_end_time_minute,
       schedule.start_time_utc as schedule_start_time,
       schedule.end_time_utc as schedule_end_time,
-      least(ticket_week_end_time, schedule.end_time_utc) - greatest(weekly_period_agent_work_time.ticket_week_start_time, schedule.start_time_utc) as scheduled_minutes,
+      least(ticket_week_end_time_minute, schedule.end_time_utc) - greatest(weekly_period_agent_work_time.ticket_week_start_time_minute, schedule.start_time_utc) as scheduled_minutes,
     from weekly_period_agent_work_time
-    join schedule on ticket_week_start_time <= schedule.end_time_utc 
-      and ticket_week_end_time >= schedule.start_time_utc
+    join schedule on ticket_week_start_time_minute <= schedule.end_time_utc 
+      and ticket_week_end_time_minute >= schedule.start_time_utc
       and weekly_period_agent_work_time.schedule_id = schedule.schedule_id
 
 ), intercepted_periods_with_running_total as (
   
     select 
       *,
-      sum(scheduled_minutes) over (partition by ticket_id order by week_number, schedule_end_time,ticket_week_start_time) as running_total_scheduled_minutes
+      sum(scheduled_minutes) over 
+        (partition by ticket_id, sla_applied_at order by valid_starting_at, week_number, schedule_end_time)
+        as running_total_scheduled_minutes
 
     from intercepted_periods_agent
 
 ), intercepted_periods_agent_with_breach_flag as (
   select 
     intercepted_periods_with_running_total.*,
-    agent_work_time_business_sla.created_at as ticket_created_at,
-    agent_work_time_business_sla.target,
-    agent_work_time_business_sla.target - running_total_scheduled_minutes as remaining_target_minutes,
-    agent_work_time_business_sla.sla_applied_at,
-    case when (agent_work_time_business_sla.target - running_total_scheduled_minutes) < 0 
+    target - running_total_scheduled_minutes as remaining_target_minutes,
+    case when (target - running_total_scheduled_minutes) = 0 then true
+       when (target - running_total_scheduled_minutes) < 0 
         and 
-          (lag(agent_work_time_business_sla.target - running_total_scheduled_minutes) over
-          (partition by intercepted_periods_with_running_total.ticket_id order by week_number, schedule_end_time,ticket_week_start_time) >= 0 
+          (lag(target - running_total_scheduled_minutes) over
+          (partition by ticket_id, sla_applied_at order by valid_starting_at, week_number, schedule_end_time) > 0 
           or 
-          lag(agent_work_time_business_sla.target - running_total_scheduled_minutes) over
-          (partition by intercepted_periods_with_running_total.ticket_id order by week_number, schedule_end_time,ticket_week_start_time) is null) 
+          lag(target - running_total_scheduled_minutes) over
+          (partition by ticket_id, sla_applied_at order by valid_starting_at, week_number, schedule_end_time) is null) 
           then true else false end as is_breached_during_schedule
           
   from  intercepted_periods_with_running_total
-  join agent_work_time_business_sla
-    on intercepted_periods_with_running_total.ticket_id = agent_work_time_business_sla.ticket_id
 
 ), intercepted_periods_agent_filtered as (
 
   select
     *,
     (remaining_target_minutes + scheduled_minutes) as breach_minutes,
-    greatest(ticket_week_start_time, schedule_start_time) - (remaining_target_minutes + scheduled_minutes) as breach_minutes_from_week
+    greatest(ticket_week_start_time_minute, schedule_start_time) + (remaining_target_minutes + scheduled_minutes) as breach_minutes_from_week
   from intercepted_periods_agent_with_breach_flag
   where is_breached_during_schedule
-
+  
 -- Now we have agent work time business hours breached_at timestamps. Only SLAs that have been breached will appear in this list, otherwise
 -- would be filtered out in the above
 ), agent_work_business_breach as (
@@ -362,7 +388,7 @@ with sla_policy_applied as (
   select 
     *,
     timestamp_add(
-      timestamp_trunc(ticket_created_at, week),
+      timestamp_trunc(valid_starting_at, week),
       interval cast(((7*24*60) * week_number) + breach_minutes_from_week as int64) minute) as breached_at
   from intercepted_periods_agent_filtered
 
@@ -370,42 +396,51 @@ with sla_policy_applied as (
 ), agent_work_time_calendar_sla as (
 
   select
-    sla_policy_applied.*,
-    ticket.created_at as ticket_created_at
+    sla_policy_applied.*
   from sla_policy_applied 
-  join zendesk.ticket on ticket.id = sla_policy_applied.ticket_id
   where sla_policy_applied.metric = 'agent_work_time'
     and sla_policy_applied.in_business_hours = 'false'
     
+), ticket_agent_work_times_post_sla as (
+  select  
+    ticket_historical_status.ticket_id,
+    greatest(ticket_historical_status.valid_starting_at, agent_work_time_calendar_sla.sla_applied_at) as valid_starting_at,
+    ticket_historical_status.valid_ending_at,
+    ticket_historical_status.status as ticket_status,
+    agent_work_time_calendar_sla.metric,
+    agent_work_time_calendar_sla.sla_applied_at,
+    agent_work_time_calendar_sla.target,    
+    agent_work_time_calendar_sla.ticket_created_at
+  from ticket_historical_status
+  join agent_work_time_calendar_sla
+    on ticket_historical_status.ticket_id = agent_work_time_calendar_sla.ticket_id
+  where status in ('new', 'open')
+  and sla_applied_at < valid_ending_at
+
 ), agent_work_time_calendar_minutes as (
 
   select 
     *,
     timestamp_diff(valid_ending_at, valid_starting_at, minute) as calendar_minutes,
     sum(timestamp_diff(valid_ending_at, valid_starting_at, minute)) 
-      over (partition by ticket_id order by valid_starting_at) as running_total_calendar_minutes
-  from ticket_agent_work_times
+      over (partition by ticket_id, sla_applied_at order by valid_starting_at) as running_total_calendar_minutes
+  from ticket_agent_work_times_post_sla
 
 ), agent_work_time_calendar_minutes_flagged as (
 
 select 
   agent_work_time_calendar_minutes.*,
-  agent_work_time_calendar_sla.created_at as ticket_created_at,
-  agent_work_time_calendar_sla.target,
-  agent_work_time_calendar_sla.target - running_total_calendar_minutes as remaining_target_minutes,
-  agent_work_time_calendar_sla.sla_applied_at,
-  case when (agent_work_time_calendar_sla.target - running_total_calendar_minutes) < 0 
+  target - running_total_calendar_minutes as remaining_target_minutes,
+  case when (target - running_total_calendar_minutes) < 0 
       and 
-        (lag(agent_work_time_calendar_sla.target - running_total_calendar_minutes) over
-        (partition by agent_work_time_calendar_minutes.ticket_id order by valid_starting_at) >= 0 
+        (lag(target - running_total_calendar_minutes) over
+        (partition by ticket_id, sla_applied_at order by valid_starting_at) >= 0 
         or 
-        lag(agent_work_time_calendar_sla.target - running_total_calendar_minutes) over
-        (partition by agent_work_time_calendar_minutes.ticket_id order by valid_starting_at) is null) 
+        lag(target - running_total_calendar_minutes) over
+        (partition by ticket_id, sla_applied_at order by valid_starting_at) is null) 
         then true else false end as is_breached_during_schedule
         
 from  agent_work_time_calendar_minutes
-join agent_work_time_calendar_sla
-  on agent_work_time_calendar_minutes.ticket_id = agent_work_time_calendar_sla.ticket_id
 
 ), agent_work_calendar_breach as (
 
@@ -449,4 +484,7 @@ union all
     breached_at
   from agent_work_business_breach
 )
-select * from all_breaches_unioned
+select 
+  *,
+  breached_at > current_timestamp as is_upcoming_breach
+from all_breaches_unioned
