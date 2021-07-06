@@ -1,0 +1,95 @@
+create or replace view zendesk.reply_time as (
+with ticket_schedule as (
+    select 
+        ticket.id as ticket_id
+        , ticket_schedule.schedule_id
+        , coalesce(ticket_schedule.created_at, ticket.created_at) as schedule_created_at
+        , coalesce(lead(schedule_created_at, 1) over (partition by ticket.id order by schedule_created_at), '9999-12-31 01:01:01'::timestamp) as schedule_invalidated_at
+    from zendesk.ticket
+    inner join zendesk.brand
+        on ticket.brand_id = brand.id
+    left join zendesk.ticket_schedule
+        on ticket.id = ticket_schedule.ticket_id
+),
+ticket_first_responded_at as (
+    select 
+        ticket_comment.ticket_id
+        , min(created) as responded_at
+    from zendesk.ticket_comment
+    join zendesk.user
+    on ticket_comment.user_id = user.id
+    where
+        public
+        and user.role in ('admin', 'agent')
+    group by ticket_id
+),
+ticket_first_responded_time as (
+    select 
+        ticket.id as ticket_id
+        , ticket_schedule.schedule_created_at
+        , ticket_schedule.schedule_invalidated_at
+        , ticket_schedule.schedule_id
+        , round(timestampdiff(second, date_trunc(week, ticket_schedule.schedule_created_at), ticket_schedule.schedule_created_at)/60, 0) as start_time_in_minutes_from_week
+        , greatest(0, round(timestampdiff(second, ticket_schedule.schedule_created_at, least(ticket_schedule.schedule_invalidated_at, min(ticket_first_responded_at.responded_at)))/60, 0)) as raw_delta_in_minutes
+    from zendesk.ticket
+    left join ticket_schedule on ticket.id = ticket_schedule.ticket_id
+    left join ticket_first_responded_at on ticket.id = ticket_first_responded_at.ticket_id
+    group by 1, 2, 3, 4
+),
+weekly_periods as (
+    select
+        ticket_id
+        , start_time_in_minutes_from_week
+        , raw_delta_in_minutes
+        , row_number() over (partition by ticket_id order by 1) - 1 as week_number
+        , schedule_id
+        , greatest(0, start_time_in_minutes_from_week - week_number * (7*24*60)) as ticket_week_start_time
+        , least(start_time_in_minutes_from_week + raw_delta_in_minutes - week_number * (7*24*60), (7*24*60)) as ticket_week_end_time
+    from ticket_first_responded_time
+    /*
+    fivetran's original query used a `generate_array` function which
+    is unavailable here. we accomplish something similar by cross joining
+    a series generator with the `row_number` window function and filtering
+    the result. week_number is zero-indexed.
+    */
+    cross join table(generator(rowcount => 52 * 3)) -- can't generate arbitrary lengths, increase this number if 3 years is not enough time
+    qualify row_number() over (partition by ticket_id order by 1) - 1 <= floor((start_time_in_minutes_from_week + raw_delta_in_minutes) / (7*24*60))
+),
+intercepted_periods as (
+    select 
+        ticket_id
+        , week_number
+        , schedule_id
+        , ticket_week_start_time
+        , ticket_week_end_time
+        , schedule.start_time_utc as schedule_start_time
+        , schedule.end_time_utc as schedule_end_time
+        , least(ticket_week_end_time, schedule.end_time_utc) - greatest(ticket_week_start_time, schedule.start_time_utc) as scheduled_minutes
+    from weekly_periods
+    left join zendesk.schedule
+        on ticket_week_start_time <= schedule.end_time_utc
+        and ticket_week_end_time >= schedule.start_time_utc
+        and weekly_periods.schedule_id = schedule.id
+),
+business_minutes as (
+    select
+        ticket_id
+        , sum(scheduled_minutes) as reply_time_in_business_minutes
+    from intercepted_periods
+    group by 1
+),
+calendar_minutes as (
+    select 
+        ticket_id
+        , sum(raw_delta_in_minutes) as reply_time_in_calendar_minutes
+    from ticket_first_responded_time
+    group by 1
+)
+select 
+    calendar_minutes.ticket_id
+    , calendar_minutes.reply_time_in_calendar_minutes
+    , business_minutes.reply_time_in_business_minutes
+from calendar_minutes
+left join business_minutes
+    on business_minutes.ticket_id = calendar_minutes.ticket_id
+);
